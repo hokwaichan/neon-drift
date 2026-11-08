@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Neon Drift — WebGL2</title>
+<style>
+html,body{margin:0;height:100%;background:#0a0014;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#fff;user-select:none;-webkit-user-select:none;touch-action:none}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;top:16px;left:20px;right:20px;display:flex;justify-content:space-between;font-size:11px;letter-spacing:.2em;color:#d7b8ff;text-shadow:0 0 8px #ff3cc7;pointer-events:none}
+#hud b{font-size:24px;display:block;letter-spacing:.04em;color:#fff}
+#hud .r{text-align:right}
+#overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;background:radial-gradient(ellipse at center,rgba(10,0,20,.25),rgba(10,0,20,.7));transition:opacity .3s;cursor:pointer}
+#overlay.hidden{opacity:0;pointer-events:none}
+h1{margin:0;font-size:clamp(44px,10vw,104px);letter-spacing:.1em;font-style:italic;line-height:1;background:linear-gradient(#fff 15%,#ff6ad5 55%,#7b2cff);-webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 0 18px rgba(255,60,200,.6))}
+.sub{font-size:13px;letter-spacing:.35em;color:#9ff;opacity:.85}
+.big{font-size:28px;letter-spacing:.1em}
+.btn{margin-top:12px;padding:12px 30px;border:1px solid #ff6ad5;letter-spacing:.3em;font-size:13px;box-shadow:0 0 18px rgba(255,106,213,.5),inset 0 0 12px rgba(255,106,213,.3);animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 32px rgba(255,106,213,.9),inset 0 0 18px rgba(255,106,213,.5)}}
+.keys{font-size:11px;color:#c9a6ff;letter-spacing:.18em;opacity:.75;line-height:1.8}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div>SCORE<b id="score">0</b></div><div class="r">SPEED<b id="speed">0</b></div></div>
+<div id="overlay">
+  <div id="ovTitle"><h1>NEON DRIFT</h1></div>
+  <div class="sub" id="ovSub">A WEBGL2 DEMO</div>
+  <div class="btn" id="ovBtn">TAP / SPACE TO START</div>
+  <div class="keys">← → or A D to steer · drag on touch<br>dodge the blocks · grab the gold</div>
+</div>
+<script>
+"use strict";
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true });
+const $ = id => document.getElementById(id);
+if (!gl) {
+  $('ovTitle').innerHTML = '<h1 style="font-size:40px">NO WEBGL2</h1>';
+  $('ovSub').textContent = 'your browser or device does not support webgl2';
+  $('ovBtn').style.display = 'none';
+  throw new Error('WebGL2 not supported');
+}
+
+/* ---------- math (column-major mat4) ---------- */
+function perspective(fovy, a, n, f) {
+  const t = 1 / Math.tan(fovy / 2), nf = 1 / (n - f);
+  return new Float32Array([t / a,0,0,0, 0,t,0,0, 0,0,(f + n) * nf,-1, 0,0,2 * f * n * nf,0]);
+}
+function lookAt(e, c, u) {
+  let zx = e[0]-c[0], zy = e[1]-c[1], zz = e[2]-c[2], l = Math.hypot(zx, zy, zz);
+  zx /= l; zy /= l; zz /= l;
+  let xx = u[1]*zz - u[2]*zy, xy = u[2]*zx - u[0]*zz, xz = u[0]*zy - u[1]*zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+  return new Float32Array([xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0,
+    -(xx*e[0]+xy*e[1]+xz*e[2]), -(yx*e[0]+yy*e[1]+yz*e[2]), -(zx*e[0]+zy*e[1]+zz*e[2]), 1]);
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k*4+r] * b[c*4+k]; o[c*4+r] = s;
+  }
+  return o;
+}
+function invert(a) {
+  const [a00,a01,a02,a03,a10,a11,a12,a13,a20,a21,a22,a23,a30,a31,a32,a33] = a;
+  const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10, b03=a01*a12-a02*a11,
+        b04=a01*a13-a03*a11, b05=a02*a13-a03*a12, b06=a20*a31-a21*a30, b07=a20*a32-a22*a30,
+        b08=a20*a33-a23*a30, b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+  const d = 1 / (b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06);
+  return new Float32Array([
+    (a11*b11-a12*b10+a13*b09)*d, (a02*b10-a01*b11-a03*b09)*d, (a31*b05-a32*b04+a33*b03)*d, (a22*b04-a21*b05-a23*b03)*d,
+    (a12*b08-a10*b11-a13*b07)*d, (a00*b11-a02*b08+a03*b07)*d, (a32*b02-a30*b05-a33*b01)*d, (a20*b05-a22*b02+a23*b01)*d,
+    (a10*b10-a11*b08+a13*b06)*d, (a01*b08-a00*b10-a03*b06)*d, (a30*b04-a31*b02+a33*b00)*d, (a21*b02-a20*b04-a23*b00)*d,
+    (a11*b07-a10*b09-a12*b06)*d, (a00*b09-a01*b07+a02*b06)*d, (a31*b01-a30*b03-a32*b00)*d, (a20*b03-a21*b01+a22*b00)*d]);
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+
+/* ---------- shaders ---------- */
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+
+const FOG = [0.36, 0.07, 0.36];
+
+// Sky: full-screen triangle, ray direction from inverse view-projection
+const skyProg = program(`#version 300 es
+out vec2 vNdc;
+void main(){
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) * 2.0 - 1.0;
+  vNdc = p; gl_Position = vec4(p, 0.0, 1.0);
+}`, `#version 300 es
+precision highp float;
+in vec2 vNdc; out vec4 o;
+uniform mat4 uInvVP; uniform float uTime; uniform vec3 uFog;
+void main(){
+  vec4 a = uInvVP * vec4(vNdc, 1.0, 1.0), b = uInvVP * vec4(vNdc, -1.0, 1.0);
+  vec3 dir = normalize(a.xyz / a.w - b.xyz / b.w);
+  float y = dir.y;
+  vec3 top = vec3(0.02, 0.0, 0.08), mid = vec3(0.22, 0.02, 0.32);
+  vec3 col = mix(uFog, mid, smoothstep(0.0, 0.15, y));
+  col = mix(col, top, smoothstep(0.12, 0.55, y));
+  // stars
+  vec3 q = floor(dir * 260.0);
+  float h = fract(sin(dot(q, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+  float tw = 0.6 + 0.4 * sin(uTime * 3.0 + h * 50.0);
+  if (h > 0.9965) col += vec3(0.9, 0.85, 1.0) * tw * smoothstep(0.08, 0.35, y);
+  // retro sun
+  vec3 sd = normalize(vec3(0.0, 0.11, -1.0));
+  float d = distance(dir, sd), r = 0.24;
+  float t = clamp((dir.y - (sd.y - r)) / (2.0 * r), 0.0, 1.0);
+  vec3 sc = mix(vec3(1.0, 0.1, 0.55), vec3(1.0, 0.88, 0.35), t);
+  float band = step(0.0, sin(dir.y * 150.0 + uTime * 1.5) + (t - 0.35) * 6.0);
+  float disc = smoothstep(r, r - 0.004, d) * band;
+  col += vec3(1.0, 0.25, 0.6) * 0.35 * exp(-max(d - r, 0.0) * 7.0);
+  col = mix(col, sc * 1.25, disc);
+  o = vec4(col, 1.0);
+}`);
+
+// Floor: scrolling neon grid
+const floorProg = program(`#version 300 es
+layout(location=0) in vec3 aPos;
+uniform mat4 uVP; out vec3 vW;
+void main(){ vW = aPos; gl_Position = uVP * vec4(aPos, 1.0); }`, `#version 300 es
+precision highp float;
+in vec3 vW; out vec4 o;
+uniform float uScroll; uniform vec3 uCam, uFog;
+void main(){
+  vec2 g = vec2(vW.x, vW.z - uScroll) / 2.0;
+  vec2 w = fwidth(g);
+  vec2 gr = abs(fract(g - 0.5) - 0.5) / max(w, 1e-4);
+  float line = 1.0 - min(min(gr.x, gr.y), 1.0);
+  float d = length(vW - uCam);
+  vec3 lc = mix(vec3(1.0, 0.2, 0.75), vec3(0.45, 0.3, 1.0), smoothstep(10.0, 120.0, d));
+  vec3 c = vec3(0.03, 0.0, 0.07) + line * lc * 1.3;
+  c += vec3(0.2, 0.9, 1.0) * (1.0 - smoothstep(0.0, 0.18, abs(abs(vW.x) - 9.0))) * 1.3;
+  c += vec3(1.0, 0.3, 0.6) * 0.3 * exp(-abs(vW.x) * 0.06) * smoothstep(40.0, 190.0, d);
+  c = mix(c, uFog, smoothstep(30.0, 175.0, d));
+  o = vec4(c, 1.0);
+}`);
+
+// Instanced meshes with neon edges
+const meshProg = program(`#version 300 es
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec3 iOffset;
+layout(location=3) in vec3 iScale;
+layout(location=4) in vec4 iColor;
+layout(location=5) in vec2 iRot;
+uniform mat4 uVP;
+out vec3 vN; out vec3 vW; out vec4 vColor; out vec3 vLocal; out vec3 vHalf;
+vec3 rot(vec3 p){
+  float cy = cos(iRot.x), sy = sin(iRot.x), cr = cos(iRot.y), sr = sin(iRot.y);
+  p = vec3(cy*p.x + sy*p.z, p.y, -sy*p.x + cy*p.z);
+  return vec3(cr*p.x - sr*p.y, sr*p.x + cr*p.y, p.z);
+}
+void main(){
+  vLocal = aPos * iScale; vHalf = iScale * 0.5;
+  vec3 w = rot(vLocal) + iOffset;
+  vN = rot(aNormal); vW = w; vColor = iColor;
+  gl_Position = uVP * vec4(w, 1.0);
+}`, `#version 300 es
+precision highp float;
+in vec3 vN; in vec3 vW; in vec4 vColor; in vec3 vLocal; in vec3 vHalf;
+out vec4 o;
+uniform vec3 uCam, uFog; uniform float uEdges;
+void main(){
+  vec3 n = normalize(vN);
+  vec3 L = normalize(vec3(0.3, 0.8, 0.5));
+  float diff = max(dot(n, L), 0.0);
+  vec3 V = normalize(uCam - vW);
+  float rim = pow(1.0 - abs(dot(n, V)), 3.0);
+  vec3 base = vColor.rgb; float edge = 0.0;
+  if (uEdges > 0.5) {
+    vec3 dd = vHalf - abs(vLocal);
+    float mn = min(dd.x, min(dd.y, dd.z)), mx = max(dd.x, max(dd.y, dd.z));
+    float sec = dd.x + dd.y + dd.z - mn - mx;
+    edge = 1.0 - smoothstep(0.035, 0.1, sec);
+    base *= 0.16;
+  }
+  vec3 lit = base * (0.35 + 0.65 * diff) + vColor.rgb * rim * 0.7;
+  vec3 col = mix(lit, vColor.rgb * 1.6, max(vColor.a, edge));
+  float d = length(uCam - vW);
+  col = mix(col, uFog, smoothstep(30.0, 165.0, d));
+  o = vec4(col, 1.0);
+}`);
+
+/* ---------- geometry ---------- */
+function cubeMesh() {
+  const out = [], faces = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+  for (const n of faces) {
+    const u = Math.abs(n[1]) > 0.5 ? [1,0,0] : [0,1,0];
+    const v = [n[1]*u[2]-n[2]*u[1], n[2]*u[0]-n[0]*u[2], n[0]*u[1]-n[1]*u[0]];
+    for (const [a, b] of [[-1,-1],[1,-1],[1,1],[-1,-1],[1,1],[-1,1]])
+      out.push(0.5*(n[0]+a*u[0]+b*v[0]), 0.5*(n[1]+a*u[1]+b*v[1]), 0.5*(n[2]+a*u[2]+b*v[2]), ...n);
+  }
+  return new Float32Array(out);
+}
+function shipMesh() {
+  const P = { N:[0,0.1,-1.4], L:[-1.0,0,0.6], R:[1.0,0,0.6], T:[0,0.42,0.3], B:[0,-0.18,0.5], K:[0,0.1,0.75] };
+  const tris = [['N','T','L'],['N','R','T'],['N','L','B'],['N','B','R'],['L','T','K'],['T','R','K'],['L','K','B'],['K','R','B']];
+  const cen = [0,0,0]; for (const k in P) for (let i = 0; i < 3; i++) cen[i] += P[k][i] / 6;
+  const out = [];
+  for (const t of tris) {
+    const [a, b, c] = t.map(k => P[k]);
+    const e1 = [b[0]-a[0], b[1]-a[1], b[2]-a[2]], e2 = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+    let n = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
+    const fc = [(a[0]+b[0]+c[0])/3-cen[0], (a[1]+b[1]+c[1])/3-cen[1], (a[2]+b[2]+c[2])/3-cen[2]];
+    if (n[0]*fc[0] + n[1]*fc[1] + n[2]*fc[2] < 0) n = n.map(x => -x);
+    const l = Math.hypot(...n); n = n.map(x => x / l);
+    for (const p of [a, b, c]) out.push(...p, ...n);
+  }
+  return new Float32Array(out);
+}
+
+const FLOATS = 12, MAX_INST = 1200;
+function makeMeshVao(data, instBuf) {
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  const layout = [[2,3,0],[3,3,12],[4,4,24],[5,2,40]];
+  for (const [loc, size, off] of layout) {
+    gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, gl.FLOAT, false, FLOATS * 4, off);
+    gl.vertexAttribDivisor(loc, 1);
+  }
+  gl.bindVertexArray(null);
+  return { vao, count: data.length / 6 };
+}
+const cubeInst = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cubeInst); gl.bufferData(gl.ARRAY_BUFFER, MAX_INST * FLOATS * 4, gl.DYNAMIC_DRAW);
+const shipInst = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, shipInst); gl.bufferData(gl.ARRAY_BUFFER, FLOATS * 4, gl.DYNAMIC_DRAW);
+const cube = makeMeshVao(cubeMesh(), cubeInst);
+const ship = makeMeshVao(shipMesh(), shipInst);
+
+const floorVao = gl.createVertexArray(); gl.bindVertexArray(floorVao);
+const fb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, fb);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-90,0,-250, 90,0,-250, 90,0,30, -90,0,-250, 90,0,30, -90,0,30]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+const emptyVao = gl.createVertexArray();
+gl.bindVertexArray(null);
+
+/* ---------- game state ---------- */
+const PALETTE = [[0.1,0.95,1.0],[1.0,0.25,0.75],[0.6,0.35,1.0]];
+const SPAWN_Z = -155;
+const S = { state: 'menu', x: 0, tx: 0, roll: 0, speed: 22, dist: 0, score: 0, gold: 0, t: 0, shake: 0, nextSpawn: 0, deadT: 0, best: 0 };
+try { S.best = +localStorage.getItem('neonDriftBest') || 0; } catch (e) {}
+let obs = [], gold = [], parts = [], pillars = [];
+for (let i = 0; i < 14; i++) for (const side of [-1, 1]) pillars.push({ x: side * 11.5, z: 12 - i * 12, c: PALETTE[(i + (side > 0 ? 1 : 0)) % 2] });
+
+function spawnRow(spd) {
+  const n = Math.random() < 0.25 ? 3 : Math.random() < 0.6 ? 2 : 1;
+  for (let i = 0; i < n; i++) {
+    const sx = rand(1.2, 3.2), moving = S.state === 'play' && S.speed > 34 && Math.random() < 0.25;
+    obs.push({ bx: rand(-7.5, 7.5), x: 0, z: SPAWN_Z - rand(0, 4), sx, sy: rand(1.0, 3.6), sz: rand(1.2, 3.0),
+      c: PALETTE[(Math.random() * 3) | 0], amp: moving ? rand(2, 4) : 0, w: rand(1.2, 2.2), ph: rand(0, 6.28) });
+  }
+  if (Math.random() < 0.45) {
+    const gx = rand(-7, 7), k = 3 + ((Math.random() * 3) | 0);
+    for (let i = 0; i < k; i++) gold.push({ x: gx, z: SPAWN_Z - 10 - i * 3, got: false, ph: i * 0.6 });
+  }
+}
+function burst(x, y, z, count, colors, power, size) {
+  for (let i = 0; i < count && parts.length < 700; i++) {
+    const th = rand(0, Math.PI * 2), ph = rand(-0.2, Math.PI / 2), sp = rand(0.3, 1) * power;
+    parts.push({ x, y, z, vx: Math.cos(th) * Math.cos(ph) * sp, vy: Math.sin(ph) * sp + power * 0.3, vz: Math.sin(th) * Math.cos(ph) * sp,
+      life: rand(0.6, 1.4), max: 1.4, c: colors[(Math.random() * colors.length) | 0], s: size * rand(0.6, 1.3), g: 1 });
+  }
+}
+function start() {
+  obs = []; gold = []; parts = [];
+  Object.assign(S, { state: 'play', x: 0, tx: 0, speed: 28, dist: 0, score: 0, gold: 0, nextSpawn: 30, deadT: 0 });
+  $('overlay').classList.add('hidden');
+}
+function crash() {
+  S.state = 'dead'; S.deadT = 0; S.shake = 1;
+  burst(S.x, 0.5, 0, 140, [[1,0.5,0.15],[1,0.2,0.7],[1,0.9,0.4],[0.2,0.9,1]], 16, 0.32);
+  if (S.score > S.best) { S.best = S.score; try { localStorage.setItem('neonDriftBest', S.best); } catch (e) {} }
+}
+
+/* ---------- input ---------- */
+const keys = { left: false, right: false };
+let dragging = false;
+const setFromPointer = e => { S.tx = clamp(((e.clientX / innerWidth) - 0.5) * 20, -8, 8); };
+addEventListener('keydown', e => {
+  if (['ArrowLeft','KeyA'].includes(e.code)) keys.left = true;
+  if (['ArrowRight','KeyD'].includes(e.code)) keys.right = true;
+  if (['Space','Enter'].includes(e.code)) { e.preventDefault(); tryStart(); }
+});
+addEventListener('keyup', e => {
+  if (['ArrowLeft','KeyA'].includes(e.code)) keys.left = false;
+  if (['ArrowRight','KeyD'].includes(e.code)) keys.right = false;
+});
+function tryStart() { if (S.state === 'menu' || (S.state === 'dead' && S.deadT > 0.8)) start(); }
+$('overlay').addEventListener('pointerdown', e => { e.preventDefault(); tryStart(); });
+canvas.addEventListener('pointerdown', e => { dragging = true; if (S.state === 'play') setFromPointer(e); });
+addEventListener('pointermove', e => { if (dragging && S.state === 'play') setFromPointer(e); });
+addEventListener('pointerup', () => dragging = false);
+addEventListener('pointercancel', () => dragging = false);
+
+/* ---------- update ---------- */
+function update(dt) {
+  S.t += dt;
+  let spd;
+  if (S.state === 'play') { S.speed = Math.min(90, S.speed + dt * 0.9); spd = S.speed; }
+  else if (S.state === 'menu') spd = 22;
+  else { S.speed *= Math.pow(0.12, dt); spd = S.speed; S.deadT += dt; }
+  const dz = spd * dt; S.dist += dz;
+
+  if (S.state === 'play') {
+    if (keys.left) S.tx -= 17 * dt;
+    if (keys.right) S.tx += 17 * dt;
+    S.tx = clamp(S.tx, -8, 8);
+  } else if (S.state === 'menu') S.tx = Math.sin(S.t * 0.7) * 5 + Math.sin(S.t * 1.9) * 1.5;
+  S.x += (S.tx - S.x) * Math.min(1, dt * 9);
+  S.roll += (clamp(-(S.tx - S.x) * 0.22, -0.75, 0.75) - S.roll) * Math.min(1, dt * 10);
+
+  if (S.state !== 'dead' && S.dist >= S.nextSpawn) { spawnRow(spd); S.nextSpawn += Math.max(9, 24 - spd * 0.17); }
+
+  for (const o of obs) { o.z += dz; o.x = clamp(o.bx + Math.sin(S.t * o.w + o.ph) * o.amp, -8, 8); }
+  obs = obs.filter(o => o.z < 15);
+  for (const g of gold) g.z += dz;
+  gold = gold.filter(g => g.z < 15 && !g.got);
+  for (const p of pillars) { p.z += dz; if (p.z > 14) p.z -= 14 * 12; }
+
+  if (S.state === 'play') {
+    for (const o of obs) if (Math.abs(o.x - S.x) < o.sx / 2 + 0.72 && Math.abs(o.z) < o.sz / 2 + 0.9) { crash(); break; }
+    for (const g of gold) if (Math.hypot(g.x - S.x, g.z) < 1.5) {
+      g.got = true; S.gold++; burst(g.x, 0.9, g.z, 24, [[1,0.85,0.25],[1,1,0.7]], 7, 0.16);
+    }
+    S.score = Math.floor(S.dist / 5) + S.gold * 50;
+  }
+  // engine trail
+  if (S.state !== 'dead') for (let i = 0; i < 2; i++) parts.push({ x: S.x + rand(-0.12, 0.12), y: 0.53 + rand(-0.06, 0.06), z: 0.9,
+    vx: rand(-0.4, 0.4), vy: rand(-0.2, 0.3), vz: rand(2, 5), life: 0.35, max: 0.35, c: Math.random() < 0.5 ? [1,0.3,0.8] : [0.3,0.9,1], s: 0.13, g: 0 });
+
+  for (const p of parts) {
+    p.vy -= 18 * dt * p.g; p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt + dz;
+    if (p.y < 0.05 && p.g) { p.y = 0.05; p.vy *= -0.45; p.vx *= 0.8; p.vz *= 0.8; }
+    p.life -= dt;
+  }
+  parts = parts.filter(p => p.life > 0);
+  S.shake = Math.max(0, S.shake - dt * 1.8);
+
+  if (S.state === 'dead' && S.deadT > 0.8 && $('overlay').classList.contains('hidden')) {
+    $('ovTitle').innerHTML = '<h1 style="font-size:clamp(40px,9vw,88px)">CRASHED</h1>';
+    $('ovSub').innerHTML = `<div class="big">${S.score}</div><div style="margin-top:6px">BEST ${S.best}</div>`;
+    $('ovBtn').textContent = 'TAP / SPACE TO RETRY';
+    $('overlay').classList.remove('hidden');
+  }
+  $('score').textContent = S.score;
+  $('speed').textContent = Math.round(spd * 3.6) + ' km/h';
+}
+
+/* ---------- render ---------- */
+const inst = new Float32Array(MAX_INST * FLOATS);
+let nInst = 0;
+function push(x, y, z, sx, sy, sz, c, a, yaw, roll) {
+  if (nInst >= MAX_INST) return;
+  inst.set([x, y, z, sx, sy, sz, c[0], c[1], c[2], a, yaw, roll], nInst++ * FLOATS);
+}
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.floor(innerWidth * dpr), h = Math.floor(innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+function render() {
+  resize();
+  const aspect = canvas.width / canvas.height;
+  const proj = perspective(aspect < 1 ? 1.3 : 0.95, aspect, 0.1, 260);
+  const sh = S.shake * S.shake;
+  const eye = [S.x * 0.55 + rand(-1, 1) * sh * 0.6, 3.0 + rand(-1, 1) * sh * 0.6, 7.5];
+  const view = lookAt(eye, [S.x * 0.75, 0.6, -12], [-S.roll * 0.06, 1, 0]);
+  const vp = mul(proj, view);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.disable(gl.CULL_FACE);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.useProgram(skyProg.p);
+  gl.uniformMatrix4fv(skyProg.u.uInvVP, false, invert(vp));
+  gl.uniform1f(skyProg.u.uTime, S.t); gl.uniform3fv(skyProg.u.uFog, FOG);
+  gl.bindVertexArray(emptyVao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.useProgram(floorProg.p);
+  gl.uniformMatrix4fv(floorProg.u.uVP, false, vp);
+  gl.uniform1f(floorProg.u.uScroll, S.dist % 2);
+  gl.uniform3fv(floorProg.u.uCam, eye); gl.uniform3fv(floorProg.u.uFog, FOG);
+  gl.bindVertexArray(floorVao); gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  nInst = 0;
+  for (const p of pillars) {
+    push(p.x, 3.5, p.z, 0.7, 7, 0.7, p.c, 0, 0, 0);
+    push(p.x, 7.2, p.z, 1.0, 0.25, 1.0, p.c, 1, 0, 0);
+  }
+  for (const o of obs) push(o.x, o.sy / 2, o.z, o.sx, o.sy, o.sz, o.c, 0, 0, 0);
+  for (const g of gold) push(g.x, 0.95 + Math.sin(S.t * 4 + g.ph) * 0.18, g.z, 0.55, 0.55, 0.55, [1, 0.82, 0.25], 1, S.t * 3 + g.ph, 0.785);
+  for (const p of parts) { const s = p.s * (p.life / p.max); push(p.x, p.y, p.z, s, s, s, p.c, 1, p.life * 8, p.life * 5); }
+  if (S.state !== 'dead') push(S.x, 0.53 + Math.sin(S.t * 3) * 0.05, 0.8, 0.45, 0.16, 0.08, [1, 0.35, 0.85], 1, 0, S.roll);
+
+  gl.useProgram(meshProg.p);
+  gl.uniformMatrix4fv(meshProg.u.uVP, false, vp);
+  gl.uniform3fv(meshProg.u.uCam, eye); gl.uniform3fv(meshProg.u.uFog, FOG);
+  gl.bindBuffer(gl.ARRAY_BUFFER, cubeInst);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst, 0, nInst * FLOATS);
+  gl.uniform1f(meshProg.u.uEdges, 1);
+  gl.bindVertexArray(cube.vao); gl.drawArraysInstanced(gl.TRIANGLES, 0, cube.count, nInst);
+
+  if (S.state !== 'dead') {
+    gl.bindBuffer(gl.ARRAY_BUFFER, shipInst);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array([S.x, 0.45 + Math.sin(S.t * 3) * 0.05, 0, 1, 1, 1, 0.55, 0.75, 1.0, 0, 0, S.roll]));
+    gl.uniform1f(meshProg.u.uEdges, 0);
+    gl.bindVertexArray(ship.vao); gl.drawArraysInstanced(gl.TRIANGLES, 0, ship.count, 1);
+  }
+  gl.bindVertexArray(null);
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
